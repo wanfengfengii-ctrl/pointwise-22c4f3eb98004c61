@@ -1,10 +1,12 @@
 import unittest
 
 from errors import EvidenceError, InvalidInput, SlotReplyLost
+from pickup.decode import decode_original
 from pickup.read import read_with_evidence
 from recode.progress import SlotWriteIntent, record_intent
 from recode.receipts import RecodeReceipt
 from recode.requests import RecodeRequest, submit_recode
+from storage import ArchiveStore
 from tests.support import ArchiveCase, FINAL_SLOTS, STRIPES, TARGET
 from volume.basis import validate_basis
 from volume.slots import compare_and_write_slot
@@ -69,6 +71,99 @@ class HandoffIncident(ArchiveCase):
         evidence = self.assert_pickup(source, 'pickup')
         self.assertEqual(evidence.basis, (1, 2, 4), f'{MARKER} pickup: wrong intermediate layout')
 
+    def test_pickup_at_every_pause_point(self):
+        # Lose the reply after the committed write that lands on each pause
+        # point of a fresh run, reopen, and pick the volume up by its original
+        # number.  Every planned step must leave the medium invertible.
+        for pause in range(1, 5):
+            with self.subTest(pause=pause):
+                self._fresh_case(pause)
+                source, _ = self.make_volume(
+                    recording_id=f'pause-recording-{pause}', volume_id=f'pause-volume-{pause}')
+                volume_id, request_id = f'pause-volume-{pause}', f'pause-request-{pause}'
+                commits = []
+
+                def lose_after_commit(event, pause=pause):
+                    if event.phase == 'after':
+                        commits.append(event)
+                        if len(commits) == pause:
+                            raise SlotReplyLost(f'pause {pause}')
+
+                pending = submit_recode(self.store, volume_id, request_id, TARGET,
+                                        on_boundary=lose_after_commit)
+                self.assertIsInstance(pending, RecodeRequest)
+                self.reopen()
+                self.assertIsNone(self.receipt(request_id))
+                pickup, evidence = read_with_evidence(self.store, volume_id)
+                self.assertEqual(pickup.stripes, STRIPES)
+                self.assertEqual(pickup.provenance, source.provenance)
+                self.assertEqual(decode_original(evidence.basis, evidence.payloads), STRIPES)
+                receipt = submit_recode(self.store, volume_id, request_id, TARGET)
+                self.assertIsInstance(receipt, RecodeReceipt)
+                self.assertEqual(tuple(slot.payload for slot in self.slots(volume_id)), FINAL_SLOTS)
+                self.reopen()
+                self.assertEqual(submit_recode(self.store, volume_id, request_id, TARGET), receipt)
+
+    def test_pause_visible_slot_bytes(self):
+        # Incident write case: one committed slot plus a lost reply must still
+        # be readable, and the committed slot must have advanced the layout.
+        source, _ = self.make_volume()
+        submit_recode(self.store, 'volume', 'request', TARGET, on_boundary=lose_committed_reply)
+        self.reopen()
+        slots = self.slots()
+        self.assertEqual(sum(slot.generation for slot in slots), 1)
+        evidence = self.assert_pickup(source, 'write-bytes')
+        self.assertNotEqual(evidence.basis, (1, 2, 5))
+        self.assertEqual(decode_original(evidence.basis, evidence.payloads), STRIPES)
+
+    def _fresh_case(self, tag):
+        self.root = self.root / str(tag)
+        self.root.mkdir()
+        self.store = ArchiveStore(self.root)
+
+    def test_equal_bytes_still_advance(self):
+        # Zero stripes encode to zero for every row, so a layout change rewrites
+        # identical bytes.  The generation, not the bytes, decides whether the
+        # lost write landed.
+        zeros = (b'\x00', b'\x00', b'\x00')
+        self.make_volume(stripes=zeros)
+        pending = submit_recode(self.store, 'volume', 'request', TARGET,
+                                on_boundary=lose_committed_reply)
+        self.assertIsInstance(pending, RecodeRequest)
+        self.reopen()
+        pickup, evidence = read_with_evidence(self.store, 'volume')
+        self.assertEqual(pickup.stripes, zeros)
+        self.assertEqual(evidence.payloads, zeros)
+        self.assertEqual(evidence.basis, (3, 2, 5))
+        receipt = submit_recode(self.store, 'volume', 'request', TARGET)
+        self.assertIsInstance(receipt, RecodeReceipt)
+        self.assertEqual(tuple(slot.payload for slot in self.slots()), zeros)
+        self.assertEqual(tuple(slot.generation for slot in self.slots()), receipt.generations)
+
+    def test_empty_stripes_each_pause(self):
+        for phase in ('before', 'after'):
+            with self.subTest(phase=phase):
+                self._fresh_case(f'empty-{phase}')
+                volume_id, request_id = f'empty-volume-{phase}', f'empty-request-{phase}'
+                empty = (b'', b'', b'')
+                self.make_volume(recording_id=f'empty-recording-{phase}', volume_id=volume_id,
+                                 stripes=empty)
+
+                def lose(event, phase=phase):
+                    if event.phase == phase:
+                        raise SlotReplyLost(phase)
+
+                pending = submit_recode(self.store, volume_id, request_id, TARGET,
+                                        on_boundary=lose)
+                self.assertIsInstance(pending, RecodeRequest)
+                self.reopen()
+                pickup, evidence = read_with_evidence(self.store, volume_id)
+                self.assertEqual(pickup.stripes, empty)
+                self.assertEqual(evidence.payloads, empty)
+                self.assertEqual(evidence.basis, (1, 2, 5) if phase == 'before' else (3, 2, 5))
+                receipt = submit_recode(self.store, volume_id, request_id, TARGET)
+                self.assertIsInstance(receipt, RecodeReceipt)
+                self.assertEqual(tuple(slot.payload for slot in self.slots(volume_id)), empty)
 
 if __name__ == '__main__':
     unittest.main()

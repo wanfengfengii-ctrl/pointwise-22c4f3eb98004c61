@@ -89,6 +89,10 @@ def submit_recode(
         current = _request_result(db, get_request(db, request_id))
         if isinstance(current, RecodeReceipt):
             return current
+        # Sign only after the physical medium itself is at the target layout;
+        # a lost reply or a later unbound change must not yield a receipt.
+        volume = get_verified_volume(db, volume_id)
+        terminal = collect_volume_evidence(store, volume, db=db)
         receipt = issue_first_receipt(db, request_id, volume_id, target, terminal, stamp=stamp)
         db.execute("UPDATE recode_requests SET status = 'done' WHERE request_id = ?", (request_id,))
         return receipt
