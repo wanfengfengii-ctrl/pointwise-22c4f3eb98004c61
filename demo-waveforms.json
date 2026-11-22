@@ -1,0 +1,12 @@
+{
+  "recording_id": "demo-rig-17",
+  "volume_id": "demo-night-volume",
+  "request_id": "demo-receiver-layout",
+  "channels": [
+    {"id": "Z", "values": [7], "origin": "rig-17 / lateral / capture-42"},
+    {"id": "X", "values": [11], "origin": "rig-17 / axial / capture-42"},
+    {"id": "Y", "values": [13], "origin": "rig-17 / vertical / capture-42"}
+  ],
+  "initial": [1, 2, 5],
+  "target": [2, 4, 3]
+}
